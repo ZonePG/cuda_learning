@@ -28,10 +28,19 @@ void cpuSgemm(
 }
 
 
+// SGEMM: Block Tile + Thread Tile + K Tile + Vec4, with smem
+// BK:TILE_K=8 BM=BN=128
+// TM=TN=8 增加计算密度 BM/TM=16 BN/TN=16
+// dim3 blockDim(BN/TN, BM/TM);
+// dim3 gridDim((N + BN - 1) / BN, (M + BM - 1) / BM)
 __global__ void sgemm_V1(
     float * __restrict__ a, float * __restrict__ b, float * __restrict__ c,
     const int M, const int N, const int K) {
-
+    // [1]  Block Tile: 一个16x16的block处理C上大小为128X128的一个目标块
+    // [2] Thread Tile: 每个thread负责计算TM*TN(8*8)个元素，增加计算密度
+    // [3]      K Tile: 将K分块，每块BK大小，迭代(K+BK-1/BK)次，
+    //                  每次计算TM*TN个元素各自的部分乘累加
+    // [4]   Vectorize: 减少load和store指令，使用float4
     const int BM = 128;
     const int BN = 128;
     const int BK = 8;
@@ -42,25 +51,36 @@ __global__ void sgemm_V1(
     const int by = blockIdx.y;
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
-    const int tid = ty * blockDim.x + tx;
+    const int tid = ty * blockDim.x + tx; // tid within the block
 
+    // 2*128*8*4=8KB
     __shared__ float s_a[BM][BK];
     __shared__ float s_b[BK][BN];
 
+    // 8*8
     float r_c[TM][TN] = {0.0};
 
+    // 0. 先计算shared memory中的索引
+    // tid 和需要加载的 smem s_a[BM][BK] 之间的索引关系 BM=128 BK=8 按行读取 A 行主序
+    // 对于 s_a 每行 8 个数据，每个线程读取 4 个，需要 2 个线程；总共128行，需要 128x2 刚好 256 线程
     int load_a_smem_m = tid >> 1;  // tid/2, row of s_a
     int load_a_smem_k = (tid & 1) << 2;  // (tid % 2 == 0) ? 0 : 4, col of s_a
+    // tid 和需要加载的 smem s_b[BK][BN] 之间的索引关系 BK=8 BN=128 按行读取 B 行主序
+    // 对于 s_b 每行 128 个数据，每个线程读 4 个数据，需要 32 个线程；总共 8 行，需要 32x8=256 个线程
     int load_b_smem_k = tid >> 5;   // tid/32, row of s_b
     int load_b_smem_n = (tid & 31) << 2;  // (tid % 32) * 4, col of s_b
-
+    // 1. 再计算全局内存中的索引
+    // 要加载到 s_a 中的元素对应到 A 全局内存中的行数，每个 block 负责出 C 中大小为 BM*BN 的块
     int load_a_gmem_m = by * BM + load_a_smem_m;  // global row of a
     int load_b_gmem_n = bx * BN + load_b_smem_n;  // global col of b
 
+    // 2. 先对 K 进行分块，每块 BK 大小
     for (int bk = 0; bk < (K + BK - 1) / BK; bk++) {
+        // 加载数据到共享内存 smem s_a BM*BK 128*8 vectorize float4
         int load_a_gmem_k = bk * BK + load_a_smem_k;   // global col of a
         int load_a_gmem_addr = OFFSET(load_a_gmem_m, load_a_gmem_k, K);
         FLOAT4(s_a[load_a_smem_m][load_a_smem_k]) = FLOAT4(a[load_a_gmem_addr]);
+        // 加载数据到共享内存 smem s_b BK*BN 8*128 vectorize float4
         int load_b_gmem_k = bk * BK + load_b_smem_k;   // global row of b
         int load_b_gmem_addr = OFFSET(load_b_gmem_k, load_b_gmem_n, N);
         FLOAT4(s_b[load_b_smem_k][load_b_smem_n]) = FLOAT4(b[load_b_gmem_addr]);
@@ -69,11 +89,13 @@ __global__ void sgemm_V1(
 
         #pragma unroll
         for (int k = 0; k < BK; k++) {
+            // 3. 每个线程负责计算 BM*BN(128x128) 中的 TM*TN(8x8) 个元素
             #pragma unroll
             for (int m = 0; m < TM; m++) {
                 #pragma unroll
                 for (int n = 0; n < TN; n++) {
-                    int comp_a_smem_m = ty * TM + m;
+                    // k from 0~7，0 ~ BK, ty and tx range from 0 to 15, 16x8=128
+                    int comp_a_smem_m = ty * TM + m; // 128*8 128/TM(8)=16 M方向 16线程
                     int comp_b_smem_n = tx * TN + n;
                     r_c[m][n] += s_a[comp_a_smem_m][k] * s_b[k][comp_b_smem_n];
                 }
@@ -84,13 +106,13 @@ __global__ void sgemm_V1(
     }
 
     #pragma unroll
-    for (int i = 0; i < TM; i++) {
-        int store_c_gmem_m = by * BM + ty * TM + i;
+    for (int m = 0; m < TM; m++) {
+        int store_c_gmem_m = by * BM + ty * TM + m;
         #pragma unroll
-        for (int j = 0; j < TN; j += 4) {
-            int store_c_gmem_n = bx * BN + tx * TN + j;
+        for (int n = 0; n < TN; n += 4) {
+            int store_c_gmem_n = bx * BN + tx * TN + n;
             int store_c_gmem_addr = OFFSET(store_c_gmem_m, store_c_gmem_n, N);
-            FLOAT4(c[store_c_gmem_addr]) = FLOAT4(r_c[i][j]);
+            FLOAT4(c[store_c_gmem_addr]) = FLOAT4(r_c[m][n]);
         }
     }
 }
